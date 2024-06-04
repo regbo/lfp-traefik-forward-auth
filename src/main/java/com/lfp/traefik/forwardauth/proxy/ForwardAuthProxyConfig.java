@@ -68,6 +68,8 @@ public class ForwardAuthProxyConfig {
      */
     String permissionsClaim = "permissions";
 
+    boolean accessTokenAuthenticationHeader = true;
+
     /**
      * Bean for Vertx instance with native transport preference
      * @return Vertx instance

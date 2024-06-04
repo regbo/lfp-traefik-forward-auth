@@ -1,4 +1,4 @@
-package com.lfp.traefik.forwardauth.proxy;
+package com.lfp.traefik.forwardauth.proxy.jwt;
 
 import io.fusionauth.jwt.JWTException;
 import io.fusionauth.jwt.Verifier;
@@ -12,6 +12,8 @@ import lombok.experimental.Accessors;
 import lombok.experimental.FieldDefaults;
 import org.apache.commons.lang3.StringUtils;
 
+import java.util.Collections;
+import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -26,7 +28,7 @@ import java.util.regex.Pattern;
 @Accessors(fluent = true)
 @Getter
 @EqualsAndHashCode
-public class JWTContext {
+public class JWTContext implements ClaimReader {
     // Pattern to match JWT strings
     private static final Pattern JWT_PATTERN = Pattern.compile("^(bearer\\s+)?([A-Za-z0-9-_]+\\.[A-Za-z0-9-_]+(\\.[A-Za-z0-9-_]+)?$)",
             Pattern.CASE_INSENSITIVE);
@@ -45,8 +47,10 @@ public class JWTContext {
 
     @NotNull
     final String encodedJWT; // Encoded JWT string
+    @Getter(AccessLevel.NONE)
     @EqualsAndHashCode.Exclude
-    transient Optional<JWT> jwt; // Parsed JWT, lazily initialized
+    transient Optional<JWT> _jwt; // Parsed JWT, lazily initialized
+
 
     /**
      * Constructs a new JWTContext with the given encoded JWT.
@@ -57,21 +61,26 @@ public class JWTContext {
         this.encodedJWT = encodedJWT;
     }
 
+    @Override
+    public Map<String, Object> getAllClaims() {
+        return jwt().map(JWT::getAllClaims).map(Collections::unmodifiableMap).orElseGet(Collections::emptyMap);
+    }
+
     /**
      * Lazily decodes and returns the JWT. If decoding fails, returns an empty Optional.
      *
      * @return an Optional containing the decoded JWT, or empty if decoding fails
      */
     public Optional<JWT> jwt() {
-        if (jwt == null) {
+        if (_jwt == null) {
             try {
                 // Decode the JWT using the insecure verifier
-                jwt = Optional.ofNullable(JWT.getDecoder().decode(encodedJWT(), INSECURE_VERIFIER));
+                _jwt = Optional.ofNullable(JWT.getDecoder().decode(encodedJWT(), INSECURE_VERIFIER));
             } catch (JWTException e) {
-                jwt = Optional.empty();
+                _jwt = Optional.empty();
             }
         }
-        return jwt;
+        return _jwt;
     }
 
     /**

@@ -3,6 +3,8 @@ package com.lfp.traefik.forwardauth.proxy;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.lfp.traefik.forwardauth.proxy.jwt.JWTContext;
+import com.lfp.traefik.forwardauth.proxy.jwt.TokenContext;
 import io.fusionauth.jwt.domain.JWT;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
@@ -60,7 +62,8 @@ public class ForwardAuthProxyVerticle extends AbstractVerticle {
         HttpClient httpClient = vertx.createHttpClient();
         HttpProxy proxy = HttpProxy.reverseProxy(httpClient);
         proxy.addInterceptor(createProxyInterceptor());
-        proxy.origin(config.getOauth2ProxyPort(), config.getOauth2ProxyHost());
+        String oauth2ProxyHost = config.getOauth2ProxyHost();
+        proxy.origin(config.getOauth2ProxyPort(), oauth2ProxyHost);
         vertx.createHttpServer().requestHandler(proxy).exceptionHandler(failure -> {
             log.error("server error", failure);
         }).listen(config.getServerPort(), config.getServerHost()).toCompletionStage().whenCompleteAsync((httpServer, failure) -> {
@@ -106,93 +109,82 @@ public class ForwardAuthProxyVerticle extends AbstractVerticle {
      * Processes the ProxyContext by extracting JWT tokens, validating roles and permissions,
      * and adding claims as headers in the response.
      *
-     * @param context the ProxyContext containing the request and response.
+     * @param proxyContext the ProxyContext containing the request and response.
      * @throws JsonProcessingException if an error occurs while processing JSON.
      */
-    private void processProxyContext(ProxyContext context) throws JsonProcessingException {
+    private void processProxyContext(ProxyContext proxyContext) throws JsonProcessingException {
         // Check if the response status is not 2xx successful
-        if (!HttpStatus.valueOf(context.response().getStatusCode()).is2xxSuccessful()) {
+        if (!HttpStatus.valueOf(proxyContext.response().getStatusCode()).is2xxSuccessful()) {
             return;
         }
-
-        // Extract access token from the response headers
-        JWTContext accessTokenContext = StreamEx.of(ACCESS_TOKEN_HEADER_NAME, HttpHeaders.AUTHORIZATION)
-                .flatCollection(context.response().headers()::getAll)
-                .mapPartial(JWTContext::from)
-                .filter(v -> v.jwt().isPresent())
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("access token not found"));
-
-        // Extract ID token from the response headers
-        var idTokenContext = StreamEx.of(HttpHeaders.AUTHORIZATION)
-                .flatCollection(context.response().headers()::getAll)
-                .mapPartial(JWTContext::from)
-                .filter(Predicate.not(accessTokenContext::equals))
-                .filter(v -> v.jwt().isPresent())
-                .findFirst().orElse(null);
-
-        var accessToken = accessTokenContext.jwt().orElseThrow();
-        var idToken = Optional.ofNullable(idTokenContext).flatMap(JWTContext::jwt).orElse(null);
-
+        var tokenContext = TokenContext.from(proxyContext.response().headers(), ACCESS_TOKEN_HEADER_NAME)
+                .orElseThrow(() -> new IllegalArgumentException("unable to parse token context"));
         // Check roles and permissions, add them to headers if found
-        for (var ent : EntryStream.of("roles", config.getRolesClaim(), "permissions", config.getPermissionsClaim()).nonNullValues()) {
-            var type = ent.getKey();
-            var requiredClaim = ent.getValue();
-            var requiredValueSets = requestValues(context.response(), requiredClaim);
-            Set<String> claimValues = StreamEx.of(accessToken, idToken)
-                    .nonNull()
-                    .map(JWT::getAllClaims)
-                    .map(v -> v.get(requiredClaim))
+        for (var claimName : StreamEx.of(config.getRolesClaim(), config.getPermissionsClaim()).nonNull()) {
+            var requiredValueSets = requestValues(proxyContext.response(), claimName);
+            Set<String> claimValues = tokenContext.claims(claimName)
                     .flatCollection(ForwardAuthProxyVerticle::parseKeys)
                     .toImmutableSet();
             if (!requiredValueSets.isEmpty() && requiredValueSets.stream().noneMatch(claimValues::containsAll)) {
-                log.warn("required {} not found - sub:{} requiredValues:{} redirectUri:{}",
-                        type,
-                        accessToken.subject,
-                        requiredValueSets,
+                log.warn("required claim not found - sub:{} claim:{} requiredValues:{} claimValues:{} redirectUri:{}",
+                         claimName,
+                         tokenContext.accessToken().subject,
+                         requiredValueSets,
+                         claimValues,
                         config.getRequestAccessUri());
-                requestAccess(context);
+                requestAccess(proxyContext);
                 return;
             }
             if (!claimValues.isEmpty()) {
-                context.response().putHeader(AUTH_REQUEST_HEADER_NAME_PREFIX + "-" + type, String.join(",", claimValues));
+                proxyContext.response().putHeader(headerName(AUTH_REQUEST_HEADER_NAME_PREFIX, claimName), String.join(",", claimValues));
             }
         }
-        log.debug("authorized user - sub:{}", accessToken.subject);
+        log.debug("authorized user - sub:{}", tokenContext.accessToken().subject);
 
         // Add claims to response headers
-        for (var ent : EntryStream.of("access-token", accessToken, "id-token", idToken).nonNullValues()) {
+        for (var ent : EntryStream.of("access-token",
+                                      tokenContext.accessTokenContext(),
+                                      "id-token",
+                                      tokenContext.idTokenContext().orElse(null)).nonNullValues()) {
             var type = ent.getKey();
-            var jwt = ent.getValue();
-            Map<String, Set<String>> claimHeaderMap = EntryStream.of(jwt.getAllClaims())
-                    .mapKeys(this::headerName)
+            var jwtContext = ent.getValue();
+            Map<String, Set<String>> claimHeaderMap = jwtContext.allClaims()
+                    .mapKeys(v -> headerName(AUTH_REQUEST_HEADER_NAME_PREFIX, type, "claims", v))
                     .mapToValuePartial((k, v) -> headerValue(v))
                     .groupingTo(LinkedHashMap::new, LinkedHashSet::new);
-            claimHeaderMap.forEach((name, values) -> {
-                var claimHeaderName = String.join("-", AUTH_REQUEST_HEADER_NAME_PREFIX, type, "claim", name);
-                for (var value : values) {
-                    context.response().headers().add(claimHeaderName, value);
+            claimHeaderMap.forEach((headerName, headerValues) -> {
+                for (var headerValue : headerValues) {
+                    proxyContext.response().headers().add(headerName, headerValue);
                 }
             });
         }
 
         // Remove original token headers and set the authorization header
-        Stream.of(ACCESS_TOKEN_HEADER_NAME, ID_TOKEN_HEADER_NAME).forEach(context.response().headers()::remove);
-        context.response().headers().set(HttpHeaders.AUTHORIZATION, "Bearer " + accessTokenContext.encodedJWT());
-        if (idTokenContext != null) {
-            context.response().headers().set(ID_TOKEN_HEADER_NAME, idTokenContext.encodedJWT());
+        Stream.of(ACCESS_TOKEN_HEADER_NAME, ID_TOKEN_HEADER_NAME).forEach(proxyContext.response().headers()::remove);
+        String idTokenHeaderName;
+        String idTokenHeaderValue = tokenContext.accessTokenContext().encodedJWT();
+        if (config.isAccessTokenAuthenticationHeader()) {
+            idTokenHeaderName = HttpHeaders.AUTHORIZATION.toString();
+            idTokenHeaderValue = "Bearer " + idTokenHeaderValue;
+        } else {
+            idTokenHeaderName = ACCESS_TOKEN_HEADER_NAME;
         }
+        proxyContext.response().headers().set(idTokenHeaderName, idTokenHeaderValue);
+        tokenContext.idTokenContext().ifPresent(jwtContext -> {
+            proxyContext.response().headers().set(ID_TOKEN_HEADER_NAME, jwtContext.encodedJWT());
+        });
+
     }
 
     /**
      * Requests access by redirecting the response to the configured access request URI.
      *
-     * @param context the ProxyContext containing the request and response.
+     * @param proxyContext the ProxyContext containing the request and response.
      * @throws JsonProcessingException if an error occurs while processing JSON.
      */
-    private void requestAccess(ProxyContext context) throws JsonProcessingException {
-        ProxyResponse response = context.response();
-        context.request().release();
+    private void requestAccess(ProxyContext proxyContext) throws JsonProcessingException {
+        ProxyResponse response = proxyContext.response();
+        proxyContext.request().release();
         response.headers().clear();
         response.setStatusCode(HttpStatus.FOUND.value());
         response.putHeader(HttpHeaders.LOCATION, config.getRequestAccessUri().toString());
@@ -200,18 +192,7 @@ public class ForwardAuthProxyVerticle extends AbstractVerticle {
         response.setBody(Body.body(Buffer.buffer(objectMapper.writeValueAsBytes(Map.of("message", HttpStatus.UNAUTHORIZED.getReasonPhrase())))));
     }
 
-    /**
-     * Normalizes a header name by converting it to lowercase and replacing non-alphanumeric characters with hyphens.
-     *
-     * @param name the original header name.
-     * @return the normalized header name.
-     */
-    private String headerName(String name) {
-        return StreamEx.ofNullable(name).flatArray(v -> v.split("[^a-zA-Z0-9]+"))
-                .filter(StringUtils::isNotEmpty)
-                .map(StringUtils::lowerCase)
-                .joining("-");
-    }
+
 
     /**
      * Converts a header value to a string, handling different types of JSON nodes.
@@ -229,6 +210,23 @@ public class ForwardAuthProxyVerticle extends AbstractVerticle {
         } else {
             return Optional.of(node.toString());
         }
+    }
+
+    /**
+     * Normalizes a header name by converting it to lowercase and replacing non-alphanumeric characters with hyphens.
+     *
+     * @param name the original header name.
+     * @return the normalized header name.
+     */
+    private static String headerName(String name, String... names) {
+        return StreamEx.ofNullable(names)
+                .flatArray(Function.identity())
+                .prepend(name)
+                .nonNull()
+                .flatArray(v -> v.split("[^a-zA-Z0-9]+"))
+                .filter(StringUtils::isNotEmpty)
+                .map(StringUtils::lowerCase)
+                .joining("-");
     }
 
     /**

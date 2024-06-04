@@ -8,7 +8,7 @@ import org.springframework.context.annotation.PropertySource;
 
 
 @SpringBootApplication
-@PropertySource("classpath:application-dev-local.properties")
+@PropertySource({"classpath:application-dev-local.properties", "classpath:application.properties"})
 public class DemoApplication implements CommandLineRunner {
 
     private static final Class<?> THIS_CLASS = new Object() {
