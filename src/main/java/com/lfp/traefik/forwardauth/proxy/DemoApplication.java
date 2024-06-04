@@ -4,9 +4,11 @@ import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.annotation.PropertySource;
 
 
 @SpringBootApplication
+@PropertySource("classpath:application-dev-local.properties")
 public class DemoApplication implements CommandLineRunner {
 
     private static final Class<?> THIS_CLASS = new Object() {
